@@ -8,3 +8,4 @@ joblib
 plotly
 requests
 vaderSentiment
+openai
