@@ -112,6 +112,84 @@ def compute_features(df, news):
     df["sentiment_MA5"] = avg_s
     return df
 
+def predict_7_days(df_feat, model, feature_cols, current_close, avg_move, vol_1sd):
+    predictions = []
+    sim_price = current_close
+    df_sim = df_feat.copy()
+
+    for day in range(1, 8):
+        last_row = df_sim.iloc[-1:]
+        for c in feature_cols:
+            if c not in last_row.columns:
+                last_row[c] = 0
+        X = last_row[feature_cols]
+
+        pred = model.predict(X)[0]
+        proba = model.predict_proba(X)[0]
+        confidence = proba[1] if pred == 1 else proba[0]
+
+        if pred == 1:
+            move = avg_move * (0.5 + confidence * 0.5)
+            sim_price += move
+        else:
+            move = avg_move * (0.5 + confidence * 0.5)
+            sim_price -= move
+
+        high_est = sim_price + vol_1sd * 0.5
+        low_est = sim_price - vol_1sd * 0.5
+
+        next_date = df_sim.index[-1] + pd.Timedelta(days=1)
+        while next_date.weekday() >= 5:
+            next_date += pd.Timedelta(days=1)
+
+        predictions.append({
+            "Date": next_date.strftime("%a, %d %b"),
+            "Direction": "📈 UP" if pred == 1 else "📉 DOWN",
+            "Confidence": f"{confidence*100:.1f}%",
+            "Target": round(sim_price, 2),
+            "High_Est": round(high_est, 2),
+            "Low_Est": round(low_est, 2)
+        })
+
+        new_row = df_sim.iloc[-1:].copy()
+        new_row.index = [next_date]
+        if pred == 1:
+            new_row["Close"] = sim_price
+            new_row["Open"] = sim_price - move * 0.3
+            new_row["High"] = high_est
+            new_row["Low"] = low_est
+        else:
+            new_row["Close"] = sim_price
+            new_row["Open"] = sim_price + move * 0.3
+            new_row["High"] = high_est
+            new_row["Low"] = low_est
+
+        new_row["Daily_Return"] = (new_row["Close"] - new_row["Open"]) / new_row["Open"]
+        df_sim = pd.concat([df_sim, new_row])
+
+        df_sim["MA_5"] = df_sim["Close"].rolling(5).mean()
+        df_sim["MA_20"] = df_sim["Close"].rolling(20).mean()
+        df_sim["MA5_above_MA20"] = (df_sim["MA_5"] > df_sim["MA_20"]).astype(int)
+        df_sim["Price_vs_MA5"] = df_sim["Close"] / df_sim["MA_5"]
+        df_sim["Price_vs_MA20"] = df_sim["Close"] / df_sim["MA_20"]
+        df_sim["Momentum_3"] = df_sim["Close"].pct_change(3)
+        df_sim["Momentum_5"] = df_sim["Close"].pct_change(5)
+        df_sim["Momentum_10"] = df_sim["Close"].pct_change(10)
+        df_sim["Volatility_5"] = df_sim["Daily_Return"].rolling(5).std()
+        df_sim["Volatility_10"] = df_sim["Daily_Return"].rolling(10).std()
+
+        for lag in [1,2,3,5,7]:
+            df_sim[f"Return_Lag_{lag}"] = df_sim["Daily_Return"].shift(lag)
+
+        delta = df_sim["Close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        df_sim["RSI"] = 100 - (100 / (1 + gain / (loss + 0.001)))
+        df_sim["Up_Day"] = (df_sim["Close"] > df_sim["Open"]).astype(int)
+        df_sim["Consecutive_Up"] = df_sim["Up_Day"].rolling(5).sum()
+
+    return predictions
+
 with st.spinner("Fetching live market data..."):
     df_stock = fetch_stock()
     news_articles = fetch_news()
@@ -137,17 +215,15 @@ g = d.clip(lower=0).rolling(14).mean()
 l = (-d.clip(upper=0)).rolling(14).mean()
 rsi = (100 - (100 / (1 + g / (l + 0.001)))).iloc[-1]
 
-# ===== CURRENT PRICE =====
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("💰 Current Price", f"₹{current['Close']:,.2f}", f"{change_pct:+.2f}%")
 col2.metric("📈 Day High", f"₹{current['High']:,.2f}")
 col3.metric("📉 Day Low", f"₹{current['Low']:,.2f}")
 col4.metric("📊 Volume", f"{current['Volume']:,.0f}")
-
 st.markdown("---")
 
-# ===== PREDICTION =====
-st.header("🔮 Tomorrow's Prediction & Price Levels")
+# ===== TOMORROW'S PREDICTION =====
+st.header("🔮 Tomorrow's Prediction")
 
 last_row = df_feat.iloc[-1:]
 for c in feature_cols:
@@ -162,62 +238,95 @@ if pred == 1:
     pred_high = current["Close"] + avg_move * 1.5
     pred_low = current["Close"] - avg_move * 0.5
     conf = proba[1] * 100
-    st.success(f"📈 **MODEL PREDICTION: STOCK GOES UP** — Confidence: {conf:.1f}%")
+    st.success(f"📈 **PREDICTION: STOCK GOES UP** — Confidence: {conf:.1f}%")
 else:
     target = current["Close"] - avg_move
     pred_high = current["Close"] + avg_move * 0.5
     pred_low = current["Close"] - avg_move * 1.5
     conf = proba[0] * 100
-    st.error(f"📉 **MODEL PREDICTION: STOCK GOES DOWN** — Confidence: {conf:.1f}%")
+    st.error(f"📉 **PREDICTION: STOCK GOES DOWN** — Confidence: {conf:.1f}%")
 
 p1, p2, p3 = st.columns(3)
 p1.metric("🟢 Predicted High", f"₹{pred_high:,.2f}")
 p2.metric("🎯 Target Price", f"₹{target:,.2f}")
 p3.metric("🔴 Predicted Low", f"₹{pred_low:,.2f}")
-
 st.markdown("---")
 
-# ===== PRICE LEVELS =====
-st.header("📐 Key Price Levels for Tomorrow")
+# ===== 7-DAY FORECAST =====
+st.header("📅 7-Day Price Forecast")
+st.caption("Model predicts each day recursively — earlier days are more reliable than later days")
 
+forecast = predict_7_days(df_feat, model, feature_cols, current["Close"], avg_move, vol_1sd)
+df_forecast = pd.DataFrame(forecast)
+
+fc1, fc2 = st.columns([2, 3])
+
+with fc1:
+    for i, row in df_forecast.iterrows():
+        reliability = "🟢" if i < 3 else "🟡" if i < 5 else "🔴"
+        st.markdown(f"**{row['Date']}** {row['Direction']} | Target: **₹{row['Target']:,.2f}** | Conf: {row['Confidence']} {reliability}")
+
+with fc2:
+    fig_fc = go.Figure()
+    dates = [datetime.strptime(r["Date"], "%a, %d %b").replace(year=datetime.now().year) for r in forecast]
+    targets = [r["Target"] for r in forecast]
+    highs = [r["High_Est"] for r in forecast]
+    lows = [r["Low_Est"] for r in forecast]
+
+    fig_fc.add_trace(go.Scatter(x=dates, y=highs, mode="lines", name="High Estimate",
+        line=dict(color="green", dash="dot"), fill=None))
+    fig_fc.add_trace(go.Scatter(x=dates, y=lows, mode="lines", name="Low Estimate",
+        line=dict(color="red", dash="dot"), fill="tonexty", fillcolor="rgba(255,255,0,0.1)"))
+    fig_fc.add_trace(go.Scatter(x=dates, y=targets, mode="lines+markers", name="Target Price",
+        line=dict(color="cyan", width=3), marker=dict(size=10)))
+    fig_fc.add_hline(y=current["Close"], line_dash="dash", line_color="white",
+        annotation_text=f"Current: ₹{current['Close']:,.2f}")
+    fig_fc.update_layout(height=350, template="plotly_dark", title="7-Day Price Forecast Band",
+        yaxis_title="Price (₹)", showlegend=True)
+    st.plotly_chart(fig_fc, use_container_width=True)
+
+st.markdown("🟢 High reliability (Day 1-3) | 🟡 Medium (Day 4-5) | 🔴 Lower (Day 6-7) — Accuracy decreases with each day")
+st.markdown("---")
+
+# ===== PIVOT POINTS =====
+st.header("📐 Key Price Levels")
 lc1, lc2, lc3 = st.columns(3)
 
 with lc1:
     st.subheader("Pivot Points")
     st.markdown(f"""
-    | Level | Price |
-    |-------|-------|
-    | **R2** | ₹{r2:,.2f} |
-    | **R1** | ₹{r1:,.2f} |
-    | **Pivot** | ₹{pivot:,.2f} |
-    | **S1** | ₹{s1:,.2f} |
-    | **S2** | ₹{s2:,.2f} |
-    """)
+| Level | Price |
+|-------|-------|
+| **R2** | ₹{r2:,.2f} |
+| **R1** | ₹{r1:,.2f} |
+| **Pivot** | ₹{pivot:,.2f} |
+| **S1** | ₹{s1:,.2f} |
+| **S2** | ₹{s2:,.2f} |
+""")
 
 with lc2:
     st.subheader("Support & Resistance")
     st.markdown(f"""
-    | Level | Price |
-    |-------|-------|
-    | **Resistance (50d)** | ₹{df_stock.tail(50)['High'].max():,.2f} |
-    | **Resistance (20d)** | ₹{df_stock.tail(20)['High'].max():,.2f} |
-    | **Support (20d)** | ₹{df_stock.tail(20)['Low'].min():,.2f} |
-    | **Support (50d)** | ₹{df_stock.tail(50)['Low'].min():,.2f} |
-    """)
+| Level | Price |
+|-------|-------|
+| **Resistance (50d)** | ₹{df_stock.tail(50)['High'].max():,.2f} |
+| **Resistance (20d)** | ₹{df_stock.tail(20)['High'].max():,.2f} |
+| **Support (20d)** | ₹{df_stock.tail(20)['Low'].min():,.2f} |
+| **Support (50d)** | ₹{df_stock.tail(50)['Low'].min():,.2f} |
+""")
 
 with lc3:
     st.subheader("Technical Indicators")
     rsi_status = "🔴 Overbought" if rsi > 70 else "🟢 Oversold" if rsi < 30 else "⚪ Neutral"
     st.markdown(f"""
-    | Indicator | Value |
-    |-----------|-------|
-    | **5-Day MA** | ₹{ma5:,.2f} |
-    | **20-Day MA** | ₹{ma20:,.2f} |
-    | **RSI (14)** | {rsi:.1f} {rsi_status} |
-    | **Volatility** | ±₹{vol_1sd:,.2f} |
-    | **Avg Daily Move** | ₹{avg_move:,.2f} |
-    """)
-
+| Indicator | Value |
+|-----------|-------|
+| **5-Day MA** | ₹{ma5:,.2f} |
+| **20-Day MA** | ₹{ma20:,.2f} |
+| **RSI (14)** | {rsi:.1f} {rsi_status} |
+| **Volatility** | ±₹{vol_1sd:,.2f} |
+| **Avg Daily Move** | ₹{avg_move:,.2f} |
+""")
 st.markdown("---")
 
 # ===== CHART =====
@@ -233,13 +342,11 @@ fig.add_hline(y=ma20, line_dash="solid", line_color="orange", annotation_text="M
 fig.update_layout(height=600, xaxis_rangeslider_visible=False, template="plotly_dark",
     title="Adani Enterprises (NSE) — 6 Month Chart with Key Levels")
 st.plotly_chart(fig, use_container_width=True)
-
 st.markdown("---")
 
 # ===== ANNUAL REPORTS =====
 st.header("📄 Annual Report Insights (Extracted via Vectorless RAG)")
-st.caption("These insights were extracted using our custom tree-index reasoning system — same concept as PageIndex")
-
+st.caption("Insights extracted using custom tree-index reasoning system — same concept as PageIndex")
 if annual_insights:
     tabs = st.tabs(["📑 FY2022", "📑 FY2023 (Hindenburg Year)", "📑 FY2024"])
     for tab, fy in zip(tabs, ["FY2022", "FY2023", "FY2024"]):
@@ -250,28 +357,28 @@ if annual_insights:
                 st.info(f"No data for {fy}")
 else:
     st.info("Annual report insights not loaded")
-
 st.markdown("---")
 
 # ===== LLM ANALYST =====
 st.header("🧠 Ask the AI Analyst")
 st.caption("Uses ALL data sources: Stock prices + News + Annual Reports + ML Model")
-
 if openai_key:
     question = st.text_input("Ask anything about Adani Enterprises:",
-        placeholder="e.g., Should I be worried about debt levels? How did Hindenburg affect financials?")
-
+        placeholder="e.g., What are the key risks? How did Hindenburg affect financials?")
     if question:
         with st.spinner("AI Analyst is thinking..."):
             client = OpenAI(api_key=openai_key)
             news_ctx = "\n".join([f"- {a.get('title','')[:100]} (sentiment: {analyzer.polarity_scores(a.get('title',''))['compound']:.2f})" for a in news_articles[:10]])
             ar_ctx = json.dumps(annual_insights, indent=2)[:4000] if annual_insights else "N/A"
+            fc_ctx = "\n".join([f"Day {i+1} ({r['Date']}): {r['Direction']} Target ₹{r['Target']:,.2f}" for i, r in enumerate(forecast)])
 
             full_context = f"""LIVE DATA (as of {df_stock.index[-1].strftime('%d %b %Y')}):
 Price: ₹{current['Close']:,.2f} | Change: {change_pct:+.2f}%
 RSI: {rsi:.1f} | MA5: ₹{ma5:,.2f} | MA20: ₹{ma20:,.2f}
-ML Prediction: {"UP" if pred==1 else "DOWN"} ({conf:.1f}% confidence)
-Target: ₹{target:,.2f} | Range: ₹{pred_low:,.2f} - ₹{pred_high:,.2f}
+ML Prediction Tomorrow: {"UP" if pred==1 else "DOWN"} ({conf:.1f}%)
+
+7-DAY FORECAST:
+{fc_ctx}
 
 RECENT NEWS:
 {news_ctx}
@@ -282,10 +389,9 @@ ANNUAL REPORT DATA (FY2022-FY2024):
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a senior financial analyst at Goldman Sachs specializing in Adani Group. "
-                     "You have access to: live stock data, ML model predictions, 3 years of annual reports, and recent news with sentiment. "
-                     "Give specific, data-backed analysis. Use exact numbers. Be honest about risks. "
-                     "Always end with a clear, balanced assessment. This is NOT financial advice."},
+                    {"role": "system", "content": "You are a senior financial analyst specializing in Adani Group. "
+                     "You have: live stock data, ML predictions (tomorrow + 7 days), 3 years of annual reports, and news. "
+                     "Give specific, data-backed analysis. Use exact numbers. Be honest about risks."},
                     {"role": "user", "content": f"Data:\n{full_context}\n\nAnalyze: {question}"}
                 ],
                 temperature=0.3
@@ -294,11 +400,10 @@ ANNUAL REPORT DATA (FY2022-FY2024):
             st.markdown(resp.choices[0].message.content)
 else:
     st.warning("👈 Enter your OpenAI API key in the sidebar to enable the AI Analyst")
-
 st.markdown("---")
 
 # ===== NEWS =====
-st.header("📰 This Week's News & Sentiment")
+st.header("📰 This Week\'s News & Sentiment")
 if news_articles:
     for a in news_articles[:15]:
         title = a.get("title", "")
@@ -308,13 +413,13 @@ if news_articles:
         st.markdown(f"{emoji} **{title[:120]}** ([link]({url})) — `{score:.2f}`")
 else:
     st.info("No news found for this week")
-
 st.markdown("---")
+
 st.header("🔧 Feature Importance — What Drives the Model?")
 imp = pd.DataFrame({"Feature": feature_cols, "Importance": model.feature_importances_})
 imp = imp.sort_values("Importance", ascending=False).head(10)
 st.bar_chart(imp.set_index("Feature"))
 
 st.markdown("---")
-st.caption("⚠️ This is a research project and NOT financial advice. Stock markets are unpredictable. Never invest based solely on model predictions.")
+st.caption("⚠️ This is a research project and NOT financial advice. Markets are unpredictable. Never invest based solely on model predictions.")
 st.caption("Built by Nitesh Nankani | Tech: XGBoost + Vectorless RAG + ChromaDB + GDELT + VADER + OpenAI + Streamlit")
